@@ -24,6 +24,7 @@
 #include "../../utils/random.hpp"
 #include "../../utils/settings.hpp"
 #include "./shared.h"
+#include "./graphics/host.hpp"
 
 static const float HDR_TYPE_SWAPCHAIN = 0.f;
 static const float HDR_TYPE_UNREAL = 1.f;
@@ -43,6 +44,43 @@ bool initial_hdr_ini_enabled = current_hdr_ini_enabled;
 float initial_hdr_upgrade = HDR_TYPE_SWAPCHAIN;
 
 ShaderInjectData shader_injection;
+
+// --- Intermediate setting floats (bound by the settings UI, packed on present) ---
+float setting_tone_map_type = 3.f;
+float setting_tone_map_per_channel = 1.f;
+float setting_tone_map_exposure = 1.f;
+float setting_tone_map_highlights = 1.f;
+float setting_tone_map_shadows = 1.f;
+float setting_tone_map_contrast = 1.f;
+float setting_tone_map_saturation = 1.f;
+float setting_tone_map_highlight_saturation = 1.f;
+float setting_tone_map_blowout = 0.f;
+float setting_tone_map_flare = 0.f;
+float setting_scene_grade_saturation_correction = 0.f;
+float setting_scene_grade_hue_correction = 0.f;
+float setting_custom_enable_post_filmgrain = 1.f;
+float setting_custom_sharpness = 0.f;
+float setting_custom_random = 0.f;
+bool setting_is_engine_hdr = false;
+
+// Pack all HDR settings into the ShaderInjectData struct's packed fields.
+void PackHdrSettings() {
+  using namespace expedition33_inject;
+  // Integer flags
+  PackHdrFlags(shader_injection,
+               static_cast<uint32_t>(setting_tone_map_type + 0.5f),
+               setting_tone_map_per_channel > 0.5f,
+               setting_custom_enable_post_filmgrain > 0.5f,
+               setting_is_engine_hdr);
+  // f16 pairs
+  PackF16Pair(shader_injection.packed_exposure_highlights, setting_tone_map_exposure, setting_tone_map_highlights);
+  PackF16Pair(shader_injection.packed_shadows_contrast, setting_tone_map_shadows, setting_tone_map_contrast);
+  PackF16Pair(shader_injection.packed_saturation_highlight_sat, setting_tone_map_saturation, setting_tone_map_highlight_saturation);
+  PackF16Pair(shader_injection.packed_blowout_flare, setting_tone_map_blowout, setting_tone_map_flare);
+  PackF16Pair(shader_injection.packed_scene_grade_sat_hue, setting_scene_grade_saturation_correction, setting_scene_grade_hue_correction);
+  PackF16Pair(shader_injection.packed_grain_strength_random, 0.f, setting_custom_random);  // grain_strength unused (commented out)
+  PackF16Pair(shader_injection.packed_sharpness_spare, setting_custom_sharpness, 0.f);
+}
 
 bool OnLutBuilderReplace(reshade::api::command_list* cmd_list) {
   lut_invalidation_level = VALIDATION_TYPE_VALID;
@@ -217,28 +255,25 @@ renodx::utils::settings::Settings settings = renodx::templates::settings::JoinSe
      },
      {hdr_upgrade_setting},
      renodx::templates::settings::CreateDefaultSettings({
-         {"ToneMapType", {.binding = &shader_injection.tone_map_type, .default_value = 3.f, .labels = {"Vanilla (UE ACES if using Unreal HDR and UE Filmic if using SDR)", "None", "ACES", "UE Filmic Extended (HDR)", "UE Filmic (SDR)"}, .parse = [](float value) { return value; }, .on_change = &OnLUTSettingChange}},
+         {"ToneMapType", {.binding = &setting_tone_map_type, .default_value = 3.f, .labels = {"Vanilla (UE ACES if using Unreal HDR and UE Filmic if using SDR)", "None", "ACES", "UE Filmic Extended (HDR)", "UE Filmic (SDR)"}, .parse = [](float value) { return value; }, .on_change = &OnLUTSettingChange}},
          {"ToneMapPeakNits", {.binding = &shader_injection.peak_white_nits, .on_change = &OnLUTSettingChange}},
          {"ToneMapGameNits", {.binding = &shader_injection.diffuse_white_nits, .on_change = &OnLUTSettingChange}},
          {"ToneMapUINits", {.binding = &shader_injection.graphics_white_nits, .on_change = &OnLUTSettingChange}},
-         {"ToneMapScaling", {.binding = &shader_injection.tone_map_per_channel, .default_value = 1.f, .labels = {"Luminance and Per Channel Blend", "Per Channel"}, .on_change = &OnLUTSettingChange}},
-         //  {"ToneMapHueCorrection", {.binding = &shader_injection.tone_map_hue_correction, .default_value = 0.f, .label = "Hue Correction (Midtones and Shadows)", .tooltip = "Hue retention strength. Only applies to midtones and shadows.", .on_change = &OnLUTSettingChange}},
-         {"SceneGradeSaturationCorrection", {.binding = &shader_injection.scene_grade_saturation_correction, .default_value = 0.f, .is_enabled = []() { return shader_injection.tone_map_per_channel == 0.f; }}},
-         {"SceneGradeHueCorrection", {.binding = &shader_injection.scene_grade_hue_correction, .default_value = 0.f, .label = "Hue Correction (Midtones and Shadows)", .tooltip = "Hue retention strength. Only applies to midtones and shadows.", .on_change = &OnLUTSettingChange}},
-         //  {"SceneGradeBlowoutRestoration", &shader_injection.scene_grade_blowout_restoration},
-         {"ColorGradeExposure", {.binding = &shader_injection.tone_map_exposure, .on_change = &OnLUTSettingChange}},
-         {"ColorGradeHighlights", {.binding = &shader_injection.tone_map_highlights, .on_change = &OnLUTSettingChange}},
-         {"ColorGradeShadows", {.binding = &shader_injection.tone_map_shadows, .on_change = &OnLUTSettingChange}},
-         {"ColorGradeContrast", {.binding = &shader_injection.tone_map_contrast, .on_change = &OnLUTSettingChange}},
-         {"ColorGradeSaturation", {.binding = &shader_injection.tone_map_saturation, .on_change = &OnLUTSettingChange}},
-         {"ColorGradeHighlightSaturation", {.binding = &shader_injection.tone_map_highlight_saturation, .on_change = &OnLUTSettingChange}},
-         {"ColorGradeBlowout", {.binding = &shader_injection.tone_map_blowout, .on_change = &OnLUTSettingChange}},
-         {"ColorGradeFlare", {.binding = &shader_injection.tone_map_flare, .on_change = &OnLUTSettingChange}},
+         {"ToneMapScaling", {.binding = &setting_tone_map_per_channel, .default_value = 1.f, .labels = {"Luminance and Per Channel Blend", "Per Channel"}, .on_change = &OnLUTSettingChange}},
+         {"SceneGradeSaturationCorrection", {.binding = &setting_scene_grade_saturation_correction, .default_value = 0.f, .is_enabled = []() { return setting_tone_map_per_channel == 0.f; }}},
+         {"SceneGradeHueCorrection", {.binding = &setting_scene_grade_hue_correction, .default_value = 0.f, .label = "Hue Correction (Midtones and Shadows)", .tooltip = "Hue retention strength. Only applies to midtones and shadows.", .on_change = &OnLUTSettingChange}},
+         {"ColorGradeExposure", {.binding = &setting_tone_map_exposure, .on_change = &OnLUTSettingChange}},
+         {"ColorGradeHighlights", {.binding = &setting_tone_map_highlights, .on_change = &OnLUTSettingChange}},
+         {"ColorGradeShadows", {.binding = &setting_tone_map_shadows, .on_change = &OnLUTSettingChange}},
+         {"ColorGradeContrast", {.binding = &setting_tone_map_contrast, .on_change = &OnLUTSettingChange}},
+         {"ColorGradeSaturation", {.binding = &setting_tone_map_saturation, .on_change = &OnLUTSettingChange}},
+         {"ColorGradeHighlightSaturation", {.binding = &setting_tone_map_highlight_saturation, .on_change = &OnLUTSettingChange}},
+         {"ColorGradeBlowout", {.binding = &setting_tone_map_blowout, .on_change = &OnLUTSettingChange}},
+         {"ColorGradeFlare", {.binding = &setting_tone_map_flare, .on_change = &OnLUTSettingChange}},
      }),
      {
          /* renodx::templates::settings::CreateSetting({
              .key = "FxGrainType",
-             .binding = &shader_injection.custom_grain_type,
              .value_type = renodx::utils::settings::SettingValueType::INTEGER,
              .default_value = 1.f,
              .label = "Grain Type",
@@ -249,17 +284,15 @@ renodx::utils::settings::Settings settings = renodx::templates::settings::JoinSe
          }),
          renodx::templates::settings::CreateSetting({
              .key = "FxGrainStrength",
-             .binding = &shader_injection.custom_grain_strength,
              .default_value = 25.f,
              .label = "Perceptual Grain Strength",
              .section = "Effects",
-             .is_enabled = []() { return shader_injection.custom_grain_type != 0; },
              .parse = [](float value) { return value * 0.01f; },
              .is_visible = []() { return renodx::templates::settings::current_settings_mode >= 2; },
          }), */
          renodx::templates::settings::CreateSetting({
              .key = "FxPostProcessGrain",
-             .binding = &shader_injection.custom_enable_post_filmgrain,
+             .binding = &setting_custom_enable_post_filmgrain,
              .value_type = renodx::utils::settings::SettingValueType::INTEGER,
              .default_value = 1.f,
              .label = "Film Grain",
@@ -270,7 +303,7 @@ renodx::utils::settings::Settings settings = renodx::templates::settings::JoinSe
          }),
          new renodx::utils::settings::Setting{
              .key = "FxSharpness",
-             .binding = &shader_injection.custom_sharpness,
+             .binding = &setting_custom_sharpness,
              .default_value = 0.f,
              .label = "RCAS Sharpness",
              .section = "Effects",
@@ -440,6 +473,10 @@ void OnInitDevice(reshade::api::device* device) {
                                                                    .use_resource_view_cloning = true});
   }
 }
+
+void OnHdrPresent(reshade::api::command_queue*, reshade::api::swapchain*, const reshade::api::rect*, const reshade::api::rect*, uint32_t, const reshade::api::rect*) {
+  PackHdrSettings();
+}
 }  // namespace
 
 extern "C" __declspec(dllexport) constexpr const char* NAME = "RenoDX";
@@ -450,10 +487,17 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+      reshade::register_event<reshade::addon_event::present>(OnHdrPresent);
 
-      renodx::mods::shader::on_create_pipeline_layout = [](auto, auto params) {
-        return static_cast<bool>(params.size() < 20);
-      };
+      // NOTE: previously this gated injection to layouts with <20 params
+      // as a defensive heuristic. With the framework's per-layout dword-
+      // budget check now reliable, the gate is no longer needed and it
+      // breaks two-addon coexistence (a second addon could inject into a
+      // layout this one rejected, leaving the layout with the second
+      // addon's b-slot but not ours, then `device->create_pipeline` for
+      // OUR replacement shaders fails because our cbuffer is missing
+      // from the root signature). Let the budget check drop layouts that
+      // genuinely don't fit instead of pre-rejecting on param count.
 
       if (!initialized) {
         renodx::utils::settings::LoadSetting(renodx::utils::settings::global_name, hdr_upgrade_setting);
@@ -464,7 +508,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         current_hdr_ini_enabled = initial_hdr_ini_enabled;
         UpdateHDRIni();
 
-        shader_injection.custom_is_engine_hdr = current_hdr_upgrade == HDR_TYPE_UNREAL ? 1.f : 0.f;
+        setting_is_engine_hdr = (current_hdr_upgrade == HDR_TYPE_UNREAL);
 
         renodx::mods::shader::expected_constant_buffer_space = 50;
         renodx::mods::shader::expected_constant_buffer_index = 13;
@@ -567,14 +611,26 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           renodx::mods::swapchain::prevent_full_screen = false;
         }
 
-        renodx::utils::random::binds.push_back(&shader_injection.custom_random);
+        renodx::utils::random::binds.push_back(&setting_custom_random);
+        PackHdrSettings();  // Initial pack so cbuffer is valid before first present
         initialized = true;
       }
+
+      // Wire the expedition33-graphics composable bundle (IS-FAST noise,
+      // A-trous reflections, DoF/fog/shadow quality). `Configure` appends
+      // the bundle's settings + custom_shaders into our local maps so the
+      // subsequent `renodx::mods::shader::Use` call sees the merged set.
+      expedition33_graphics::Configure({
+          .host_shader_injection = &shader_injection,
+          .host_settings         = &settings,
+          .host_custom_shaders   = &custom_shaders,
+      });
 
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
       break;
     case DLL_PROCESS_DETACH:
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+      reshade::unregister_event<reshade::addon_event::present>(OnHdrPresent);
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::unregister_addon(h_module);
       break;
@@ -587,6 +643,11 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   if (UsingSwapchainUpgrade()) {
     renodx::mods::swapchain::Use(fdw_reason, &shader_injection);
   }
+  // Wire the graphics bundle's framework hooks (state/descriptor/pipeline-
+  // layout tracking, present hook for frame-index packing, etc.) BEFORE
+  // mods::shader::Use so any layout/state setup is in place before the
+  // first pipeline-creation event fires.
+  expedition33_graphics::Use(h_module, fdw_reason);
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
 
   return TRUE;
