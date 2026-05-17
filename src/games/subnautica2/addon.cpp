@@ -4,7 +4,7 @@
  */
 
 #define ImTextureID ImU64
-#define DEBUG_LEVEL_0
+#define DEBUG_LEVEL_1
 
 #include <deps/imgui/imgui.h>
 #include <embed/shaders.h>
@@ -63,6 +63,7 @@ struct StagingSettings {
   float processing_use_scrgb = 0.f;
   float custom_lut_scaling = 0.f;
   float custom_lut_gamut_restoration = 0.f;
+  float fx_upgrade_render = 1.f;
 } staging;
 
 // Pack staging settings into the shader_injection struct
@@ -303,6 +304,16 @@ renodx::utils::settings::Settings settings = {
         .is_enabled = []() { return staging.tone_map_type != 0; },
         .parse = [](float value) { return value == 0 ? 0.f : exp2(-(1.f - (value * 0.01f))); },
     },
+    new renodx::utils::settings::Setting{
+        .key = "FxUpgradeRender",
+        .binding = &staging.fx_upgrade_render,
+        .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+        .default_value = 0.f,
+        .label = "Upgrade Render Precision (DON'T USE WITH AMD)",
+        .section = "Effects",
+        .tooltip = "Upgrades R11G11B10 render targets to R16G16B16A16F (reduces fog banding) - won't work on AMD.",
+        .labels = {"Off", "On"},
+    },
 
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
@@ -374,6 +385,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
 
+      renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
+
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
 
@@ -391,15 +404,12 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
         renodx::mods::swapchain::expected_constant_buffer_space = 50;
 
         renodx::mods::swapchain::use_resource_cloning = true;
-        renodx::mods::swapchain::swap_chain_proxy_shaders = {
-            {
-                reshade::api::device_api::d3d12,
-                {
-                    .vertex_shader = __swap_chain_proxy_vertex_shader_dx12,
-                    .pixel_shader = __swap_chain_proxy_pixel_shader_dx12,
-                },
-            },
-        };
+        renodx::mods::swapchain::use_resize_buffer = true;
+        renodx::mods::swapchain::set_color_space = false;
+        renodx::mods::swapchain::force_borderless = false;
+        renodx::mods::swapchain::prevent_full_screen = false;
+        renodx::mods::swapchain::force_screen_tearing = false;
+        renodx::mods::swapchain::SetUseHDR10(true);
 
         // Upgrade the 32x32x32 LUT texture to float16
         renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
@@ -409,7 +419,17 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
             .resource_tag = 1.f,
         });
 
-        // Set processing path to HDR (native HDR game)
+        // Upgrade R11G11B10 render targets to float16 — eliminates fog banding
+        // Note: may have issues on AMD GPUs — FxUpgradeRender setting allows disabling
+        if (renodx::utils::settings::FindSetting("FxUpgradeRender")->GetValue() > 0.5f) {
+          renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
+              .old_format = reshade::api::format::r11g11b10_float,
+              .new_format = reshade::api::format::r16g16b16a16_float,
+              .ignore_size = true,
+              .use_resource_view_cloning = true,
+          });
+        }
+
         staging.processing_path = 0.f;
 
         initialized = true;
@@ -418,19 +438,24 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       break;
     case DLL_PROCESS_DETACH:
-      renodx::utils::shader::Use(fdw_reason);
-      renodx::utils::swapchain::Use(fdw_reason);
-      renodx::utils::resource::Use(fdw_reason);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
-      reshade::unregister_addon(h_module);
       break;
   }
 
-  renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
-  renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
   renodx::utils::random::Use(fdw_reason);
+  renodx::mods::swapchain::Use(fdw_reason, &shader_injection);
+  renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
   subnautica2_graphics::Use(h_module, fdw_reason, &shader_injection);
+
+  if (fdw_reason == DLL_PROCESS_ATTACH) {
+    std::stringstream s;
+    s << "subnautica2::DllMain(post-Use: ";
+    s << "use_resource_cloning=" << (renodx::mods::swapchain::use_resource_cloning ? "true" : "false");
+    s << ", targets=" << renodx::mods::swapchain::resource_upgrade_infos.size();
+    s << ")";
+    reshade::log::message(reshade::log::level::info, s.str().c_str());
+  }
 
   if (fdw_reason == DLL_PROCESS_DETACH) {
     reshade::unregister_addon(h_module);

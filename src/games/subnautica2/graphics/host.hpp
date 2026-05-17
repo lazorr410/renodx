@@ -23,6 +23,7 @@
 #define ImTextureID ImU64
 #define DEBUG_LEVEL_0
 
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <sstream>
@@ -127,7 +128,7 @@ static void PackShaderInjection() {
 // analysis.
 reshade::api::resource fast_noise_resource = {0};
 reshade::api::resource_view fast_noise_srv = {0};
-bool fast_noise_created = false;
+std::atomic<bool> fast_noise_created{false};
 reshade::api::device* texture_owner_device = nullptr;  // device that owns the buffer
 
 static constexpr uint32_t NOISE_WIDTH = 128;
@@ -264,7 +265,7 @@ inline void AppendSettings(renodx::utils::settings::Settings& host_settings) {
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f,
       .label = "IS-FAST Noise (Volumetrics)",
-      .section = "Graphics Quality",
+      .section = "Volumetrics",
       .tooltip = "Replaces InterleavedGradientNoise with IS-FAST blue noise for volumetric fog",
       .labels = {"Off", "On"},
   });
@@ -274,7 +275,7 @@ inline void AppendSettings(renodx::utils::settings::Settings& host_settings) {
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f,
       .label = "IS-FAST Fog Dithering",
-      .section = "Graphics Quality",
+      .section = "Volumetrics",
       .tooltip = "Uses IS-FAST noise for volumetric fog ray marching dither",
       .labels = {"Off", "On"},
   });
@@ -284,7 +285,7 @@ inline void AppendSettings(renodx::utils::settings::Settings& host_settings) {
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 1.f,
       .label = "Fog History Filter",
-      .section = "Graphics Quality",
+      .section = "Volumetrics",
       .tooltip = "Filter mode for volumetric fog temporal reprojection",
       .labels = {"Bilinear", "B-Spline Tricubic", "Catmull-Rom Tricubic", "Triquadratic B-Spline"},
   });
@@ -294,7 +295,7 @@ inline void AppendSettings(renodx::utils::settings::Settings& host_settings) {
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f,
       .label = "Jittered Fog Upscale",
-      .section = "Graphics Quality",
+      .section = "Volumetrics",
       .tooltip = "Adds sub-pixel jitter to the half-res fog bilateral upscale for temporal super-resolution",
       .labels = {"Off", "On"},
   });
@@ -304,7 +305,7 @@ inline void AppendSettings(renodx::utils::settings::Settings& host_settings) {
       .value_type = renodx::utils::settings::SettingValueType::INTEGER,
       .default_value = 0.f,
       .label = "Debug: Noise",
-      .section = "Graphics Debug",
+      .section = "Volumetrics",
       .tooltip = "Visualize noise pattern",
       .labels = {"Off", "Show Pattern"},
   });
@@ -314,7 +315,7 @@ inline void AppendSettings(renodx::utils::settings::Settings& host_settings) {
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 1.f,
       .label = "IS-FAST Noise (Reflections)",
-      .section = "Graphics Quality",
+      .section = "Reflections",
       .tooltip = "Replaces BlueNoise/IGN with IS-FAST blue noise in Lumen reflection shaders",
       .labels = {"Off", "On"},
   });
@@ -324,19 +325,9 @@ inline void AppendSettings(renodx::utils::settings::Settings& host_settings) {
       .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
       .default_value = 0.f,
       .label = "LEAN Lobe Widening (Reflections)",
-      .section = "Graphics Quality",
+      .section = "Reflections",
       .tooltip = "Widens GGX lobe by sub-pixel normal variance to reduce temporal boil. Experimental.",
       .labels = {"Off", "On"},
-  });
-  host_settings.push_back(new renodx::utils::settings::Setting{
-      .key = "GraphicsDebugFog",
-      .binding = &setting_debug_fog,
-      .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-      .default_value = 0.f,
-      .label = "Debug: Fog",
-      .section = "Graphics Debug",
-      .tooltip = "Visualize fog filter differences",
-      .labels = {"Off", "Show Noise Read", "Show Filter Diff"},
   });
 }
 
