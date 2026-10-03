@@ -263,41 +263,29 @@ static void ReplayPushDescriptors(
     reshade::api::pipeline_layout layout,
     uint32_t layout_param,
     const reshade::api::descriptor_table_update& update) {
-  cmd_list->push_descriptors(stages, layout, layout_param, update);
-
   if (update.type == reshade::api::descriptor_type::buffer_unordered_access_view
       && update.binding == 0u
       && update.array_offset == 0u
       && update.count == 1u
       && renodx::utils::bitwise::HasAnyFlag(stages, reshade::api::shader_stage::all_graphics)
       && cmd_list->get_device()->get_api() == reshade::api::device_api::d3d12) {
-    bool is_root_descriptor = false;
-    renodx::utils::pipeline_layout::GetPipelineLayoutData(
-        layout,
-        [&](const auto* layout_data) {
-          if (layout_param >= layout_data->params.size()) return;
-          const auto& param = layout_data->params[layout_param];
-          if (param.type != reshade::api::pipeline_layout_param_type::push_descriptors) return;
-          is_root_descriptor = param.push_descriptors.binding == 0u
-                               && param.push_descriptors.count == 1u
-                               && param.push_descriptors.type
-                                      == reshade::api::descriptor_type::buffer_unordered_access_view;
-        });
-
-    if (is_root_descriptor) {
       const auto gpu_address = cmd_list->get_device()->get_resource_view_gpu_address(
-          *static_cast<const reshade::api::resource_view*>(update.descriptors));
+        *static_cast<const reshade::api::resource_view*>(update.descriptors));
       assert(gpu_address != 0u);
       if (gpu_address == 0u) return;
 
-      // ReShade 6.7.3 incorrectly uses SetGraphicsRootShaderResourceView for
-      // this case. Keep its bookkeeping call above, then correct the native
-      // graphics root argument.
+      // This shape is always a root descriptor in ReShade's D3D12 backend.
+      // Establish its signature without issuing the backend's erroneous SRV write.
+      cmd_list->bind_descriptor_tables(stages, layout, 0u, 0u, nullptr);
       auto* native_cmd_list = reinterpret_cast<ID3D12GraphicsCommandList*>(
-          static_cast<uintptr_t>(cmd_list->get_native()));
+        static_cast<uintptr_t>(cmd_list->get_native()));
       native_cmd_list->SetGraphicsRootUnorderedAccessView(layout_param, gpu_address);
-    }
+      if (bitwise::HasAnyFlag(stages, reshade::api::shader_stage::all_compute | reshade::api::shader_stage::all_ray_tracing)) {
+        native_cmd_list->SetComputeRootUnorderedAccessView(layout_param, gpu_address);
+      }
+      return;
   }
+  cmd_list->push_descriptors(stages, layout, layout_param, update);
 }
 
 struct PushedDescriptorSlots {
@@ -985,9 +973,11 @@ struct CommandListSnapshotData {
   static void ApplyPushState(
       reshade::api::command_list* cmd_list,
       const ShaderStagePushState& push_state,
-      bool replay_descriptor_slots = false) {
+      bool replay_descriptor_slots = false,
+      reshade::api::pipeline_layout replacement_layout = {0u}) {
     push_state.AssertInvariants();
     if (push_state.layout.handle == 0u) return;
+    const auto layout = (replacement_layout.handle != 0u ? replacement_layout : push_state.layout);
 
     for (const auto& bank : push_state.descriptor_banks) {
       if (push_state.has_unresolved_descriptors) break;
@@ -995,7 +985,7 @@ struct CommandListSnapshotData {
         size_t end = first + 1u;
         while (end < bank.count && bank.Next(end) == end) ++end;
         ReplayPushDescriptors(
-            cmd_list, push_state.stage, push_state.layout, bank.layout_param,
+            cmd_list, push_state.stage, layout, bank.layout_param,
             {.binding = bank.binding,
              .array_offset = static_cast<uint32_t>(first),
              .count = static_cast<uint32_t>(end - first),
@@ -1015,7 +1005,7 @@ struct CommandListSnapshotData {
           size_t end = first + 1u;
           while (end < slots.known_slots.size() && slots.known_slots[end] != 0u) ++end;
           cmd_list->push_descriptors(
-              push_state.stage, push_state.layout, slots.layout_param,
+              push_state.stage, layout, slots.layout_param,
               {.binding = static_cast<uint32_t>(first),
                .count = static_cast<uint32_t>(end - first),
                .type = slots.type,
@@ -1029,7 +1019,7 @@ struct CommandListSnapshotData {
       ReplayPushDescriptors(
           cmd_list,
           push_state.stage,
-          push_state.layout,
+          layout,
           descriptor.layout_param,
           {
               .table = {},
@@ -1055,7 +1045,7 @@ struct CommandListSnapshotData {
         }
         cmd_list->push_constants(
             push_state.stage,
-            push_state.layout,
+            layout,
             constants.layout_param,
             static_cast<uint32_t>(first),
             static_cast<uint32_t>(end - first),
@@ -1714,6 +1704,40 @@ struct CommandListState {
 
 class CommandListSnapshot final {
  public:
+  // The caller must supply a layout preserving every original root-parameter index.
+  // Validation completes before any GPU state is changed.
+  [[nodiscard]] bool ApplyRootArguments(
+      reshade::api::pipeline_layout original_layout,
+      reshade::api::pipeline_layout target_layout,
+      bool is_dispatch) const {
+    if (state.device_api != reshade::api::device_api::d3d12
+        || original_layout.handle == 0u || target_layout.handle == 0u) return false;
+    const auto root_layout = (is_dispatch ? state.compute_root_pipeline_layout : state.graphics_root_pipeline_layout);
+    if (root_layout != original_layout) return false;
+    const auto stages = (is_dispatch ? reshade::api::shader_stage::compute : reshade::api::shader_stage::all_graphics);
+    const auto table_layout = (is_dispatch ? state.compute_pipeline_layout : state.graphics_pipeline_layout);
+    if (table_layout.handle != 0u && table_layout != original_layout) return false;
+    for (const auto& push_state : state.shader_stage_push_states) {
+      if (!bitwise::HasAnyFlag(stages, push_state.stage)) continue;
+      if (push_state.has_unresolved_descriptors
+          || (push_state.layout.handle != 0u && push_state.layout != original_layout)) return false;
+    }
+    command_list->bind_descriptor_tables(stages, target_layout, 0u, 0u, nullptr);
+    internal::CommandListSnapshotData::ApplyDescriptorTables(
+        command_list, stages, target_layout,
+        (is_dispatch ? state.compute_descriptor_tables : state.graphics_descriptor_tables),
+#if RESHADE_API_VERSION >= 20
+        (is_dispatch ? state.compute_descriptor_table_dynamic_offsets : state.graphics_descriptor_table_dynamic_offsets),
+#endif
+        (is_dispatch ? state.compute_descriptor_tables_known : state.graphics_descriptor_tables_known));
+    for (const auto& push_state : state.shader_stage_push_states) {
+      if (bitwise::HasAnyFlag(stages, push_state.stage)) {
+        internal::CommandListSnapshotData::ApplyPushState(command_list, push_state, false, target_layout);
+      }
+    }
+    return true;
+  }
+
   void RestoreConstantBufferBindings(uint32_t slot, bool is_dispatch) const {
     if (slot >= D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT
         || (state.device_api != reshade::api::device_api::d3d10
@@ -1754,8 +1778,11 @@ class CommandListSnapshot final {
     state.ApplyRayTracing(command_list, apply_pipelines);
   }
 
-  void ApplyPipelines(PipelineBindPoint bind_point = PipelineBindPoint::UNKNOWN) const {
+  void ApplyPipelines(PipelineBindPoint bind_point = PipelineBindPoint::UNKNOWN, bool restore_dynamic_states = false) const {
     state.ApplyPipelines(command_list, bind_point);
+    if (restore_dynamic_states) {
+      state.ApplyDynamicStates(command_list, bind_point);
+    }
   }
 
  private:

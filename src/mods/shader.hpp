@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -192,6 +193,8 @@ static thread_local std::unordered_map<uint64_t, std::vector<std::vector<reshade
 static float* shader_injection = nullptr;
 static size_t shader_injection_size = 0;
 static bool use_pipeline_layout_cloning = false;
+// D3D12 direct commands only; other APIs retain their legacy injection paths.
+static bool use_selective_pipeline_injection = false;
 static bool manual_shader_scheduling = false;
 static bool force_pipeline_cloning = false;
 [[deprecated]] static bool trace_unmodified_shaders = false;  // Deprecated/dead no-op.
@@ -668,10 +671,13 @@ static std::vector<uint32_t> GetVulkanDescriptorSetParamIndexes(
 }
 
 // Shader Injection
-static bool OnCreatePipelineLayout(
+static bool BuildPipelineLayoutInjection(
     reshade::api::device* device,
-    uint32_t& param_count,
-    reshade::api::pipeline_layout_param*& params) {
+    uint32_t* output_param_count,
+    reshade::api::pipeline_layout_param** output_params,
+    bool require_full_injection) {
+  auto param_count = *output_param_count;
+  auto* params = *output_params;
   uint32_t cbv_index = 0;
   uint32_t pc_count = 0;
   uint32_t pdss_index = -1;
@@ -1085,7 +1091,7 @@ static bool OnCreatePipelineLayout(
       s << ", descriptor_injection_cost: " << descriptor_injection_cost;
       s << " )";
       reshade::log::message(reshade::log::level::warning, s.str().c_str());
-      if (!allow_undersized_shader_injection) {
+      if (require_full_injection || !allow_undersized_shader_injection) {
         return false;
       }
     }
@@ -1110,6 +1116,8 @@ static bool OnCreatePipelineLayout(
   created_params.push_back(std::move(new_params));
   params = created_params.back().data();
   param_count = new_count;
+  *output_params = params;
+  *output_param_count = param_count;
 
   const uint32_t final_dword_count = dword_count + constant_injection_cost + descriptor_injection_cost;
   std::stringstream s;
@@ -1154,12 +1162,205 @@ static bool OnCreatePipelineLayout(
   return true;
 }
 
+static bool OnCreatePipelineLayout(
+    reshade::api::device* device,
+    uint32_t& param_count,
+    reshade::api::pipeline_layout_param*& params) {
+  if (use_selective_pipeline_injection && device->get_api() == reshade::api::device_api::d3d12) return false;
+  return BuildPipelineLayoutInjection(device, &param_count, &params, false);
+}
+
+struct SelectiveLayout {
+  reshade::api::device* device = nullptr;
+  reshade::api::pipeline_layout layout = {0u};
+  int32_t injection_index = -1;
+
+  ~SelectiveLayout() {
+    if (layout.handle != 0u) {
+      device->destroy_pipeline_layout(layout);
+    }
+  }
+};
+
+// Injection requirements are immutable and uniform for this module's constant-only mode.
+static utils::data::ParallelFlatHashMap<
+    std::pair<reshade::api::device*, uint64_t>, std::shared_ptr<SelectiveLayout>, std::shared_mutex> selective_layouts;
+static utils::data::ParallelFlatHashMap<
+    uint64_t, std::shared_ptr<SelectiveLayout>, std::shared_mutex> selective_pipeline_layouts;
+static std::shared_mutex selective_retirement_mutex;
+static std::vector<std::shared_ptr<SelectiveLayout>> retired_selective_layouts;
+
+static void RetireSelectiveLayout(std::shared_ptr<SelectiveLayout> layout) {
+  if (layout == nullptr) return;
+  const std::unique_lock lock(selective_retirement_mutex);
+  retired_selective_layouts.push_back(std::move(layout));
+}
+
+static void CollectSelectiveLayouts(reshade::api::device* device) {
+  std::vector<std::shared_ptr<SelectiveLayout>> retired;
+  {
+    const std::unique_lock lock(selective_retirement_mutex);
+    std::erase_if(retired_selective_layouts, [&](auto& layout) {
+      if (layout->device != device) return false;
+      retired.push_back(std::move(layout));
+      return true;
+    });
+  }
+  // D3D12 destruction notifications hold the driver's root-signature cache lock.
+  // Release only from an outer Present/device teardown, never from those callbacks.
+}
+
+static void OnDestroySelectiveDevice(reshade::api::device* device) {
+  std::vector<std::pair<reshade::api::device*, uint64_t>> keys;
+  selective_layouts.for_each([&](const auto& entry) {
+    if (entry.first.first == device) {
+      keys.push_back(entry.first);
+    }
+  });
+  for (const auto& key : keys) {
+    std::shared_ptr<SelectiveLayout> retired;
+    selective_layouts.erase_if(key, [&](auto& entry) {
+      retired = std::move(entry.second);
+      return true;
+    });
+    RetireSelectiveLayout(std::move(retired));
+  }
+  std::vector<uint64_t> pipelines;
+  selective_pipeline_layouts.for_each([&](const auto& entry) {
+    if (entry.second->device == device) {
+      pipelines.push_back(entry.first);
+    }
+  });
+  for (const auto pipeline : pipelines) {
+    std::shared_ptr<SelectiveLayout> retired;
+    selective_pipeline_layouts.erase_if(pipeline, [&](auto& entry) {
+      retired = std::move(entry.second);
+      return true;
+    });
+    RetireSelectiveLayout(std::move(retired));
+  }
+  CollectSelectiveLayouts(device);
+}
+
+static void OnConfigureSelectiveReplacement(
+    utils::shader::PipelineShaderDetails* details,
+    std::span<const utils::pipeline::PipelineShaderHashEntry> shaders) {
+  if (details->device->get_api() != reshade::api::device_api::d3d12) return;
+  bool matched = false;
+  for (const auto& identity : shaders) {
+    custom_shaders.if_contains(identity.shader_hash, [&](const auto& entry) {
+      const auto& [hash, shader] = entry;
+      matched |= !shader.code.empty() || shader.code_by_device.contains(reshade::api::device_api::d3d12);
+    });
+  }
+  if (!matched) return;
+  if (details->command_scoped) {
+    details->replacement_blocked = true;
+    reshade::log::message(reshade::log::level::error, "mods::shader selective injection: conflicting pipeline owners");
+    return;
+  }
+  details->command_scoped = true;
+  details->replacement_blocked = true;
+  auto* device_data = utils::data::Get<DeviceData>(details->device);
+  if (device_data == nullptr || shader_injection_size == 0u || expected_constant_buffer_index < 0
+      || use_root_signature_cbv || !device_data->injected_descriptor_params.empty() || use_pipeline_layout_cloning) {
+    reshade::log::message(reshade::log::level::error, "mods::shader selective injection requires explicit root constants without extra ViewBindings or legacy layout cloning");
+    return;
+  }
+
+  const auto key = std::pair{details->device, details->layout.handle};
+  std::shared_ptr<SelectiveLayout> selected;
+  selective_layouts.if_contains(key, [&](const auto& entry) { selected = entry.second; });
+  if (selected == nullptr) {
+    auto candidate = std::make_shared<SelectiveLayout>();
+    candidate->device = details->device;
+    utils::pipeline_layout::PipelineLayoutData owned;
+    const bool found = utils::pipeline_layout::GetPipelineLayoutData(details->layout, [&](const auto* data) {
+      owned = *data;
+    });
+    // Rebase the owned copy before calling eligibility callbacks or the driver,
+    // neither of which may run while holding the shared metadata map lock.
+    for (size_t i = 0u; i < owned.params.size(); ++i) {
+      auto& param = owned.params[i];
+      switch (param.type) {
+        case reshade::api::pipeline_layout_param_type::descriptor_table:
+        case reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges:
+          param.descriptor_table.ranges = owned.ranges[i].data();
+          break;
+#if RESHADE_API_VERSION >= 20
+        case reshade::api::pipeline_layout_param_type::descriptor_table_with_flags:
+        case reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges_and_flags: {
+          auto& ranges = owned.ranges_with_flags[i];
+          param.descriptor_table_with_flags.ranges = ranges.data();
+#else
+        case reshade::api::pipeline_layout_param_type::descriptor_table_with_static_samplers:
+        case reshade::api::pipeline_layout_param_type::push_descriptors_with_static_samplers: {
+          auto& ranges = owned.ranges_with_static_samplers[i];
+          param.descriptor_table_with_static_samplers.ranges = ranges.data();
+#endif
+          size_t offset = 0u;
+          for (auto& range : ranges) {
+            if (range.static_samplers == nullptr) continue;
+            range.static_samplers = owned.static_samplers[i].data() + offset;
+            offset += range.count;
+          }
+          break;
+        }
+        default:
+          break;
+      }
+    }
+    auto count = static_cast<uint32_t>(owned.params.size());
+    auto* params = owned.params.data();
+    if (found && owned.injection_layout.handle == 0u
+        && BuildPipelineLayoutInjection(details->device, &count, &params, true)) {
+      for (uint32_t index = 0u; index < count; ++index) {
+        if (params[index].type == reshade::api::pipeline_layout_param_type::push_constants
+            && params[index].push_constants.dx_register_index == static_cast<uint32_t>(expected_constant_buffer_index)
+            && params[index].push_constants.dx_register_space == expected_constant_buffer_space) {
+          candidate->injection_index = static_cast<int32_t>(index);
+        }
+      }
+      if (candidate->injection_index >= 0) {
+        details->device->create_pipeline_layout(count, params, &candidate->layout);
+      }
+      created_params.pop_back();
+      created_descriptor_ranges.pop_back();
+    }
+    if (candidate->layout.handle == 0u) {
+      utils::log::w("mods::shader selective injection rejected layout ", utils::log::AsPtr(details->layout.handle),
+                    " (eligibility, register collision, root budget, or creation failure); retaining original PSO");
+    }
+    selective_layouts.lazy_emplace_l(key,
+        [&](auto& entry) { selected = entry.second; },
+        [&](const auto& ctor) { ctor(key, candidate); selected = candidate; });
+  }
+  if (selected->layout.handle == 0u) return;
+  selective_pipeline_layouts.insert_or_assign(details->pipeline.handle, selected);
+  details->replacement_layout = selected->layout;
+  details->injection_layout = selected->layout;
+  details->injection_index = selected->injection_index;
+  details->injection_register_index = expected_constant_buffer_index;
+  details->injection_constant_buffer_offset = 0;
+  details->replacement_blocked = false;
+}
+
+static void OnDestroySelectivePipeline(const utils::pipeline::PipelineInfo& info) {
+  std::shared_ptr<SelectiveLayout> retired;
+  selective_pipeline_layouts.erase_if(info.pipeline.handle, [&](auto& entry) {
+    retired = std::move(entry.second);
+    return true;
+  });
+  RetireSelectiveLayout(std::move(retired));
+}
+
 // AfterCreateRootSignature
 static void OnInitPipelineLayout(
     reshade::api::device* device,
     const uint32_t param_count,
     const reshade::api::pipeline_layout_param* params,
     reshade::api::pipeline_layout layout) {
+  if (use_selective_pipeline_injection && device->get_api() == reshade::api::device_api::d3d12) return;
   assert(layout.handle != 0u);
   const auto original_layout = layout;
   if (on_init_pipeline_layout != nullptr) {
@@ -1788,6 +1989,12 @@ static void OnDestroyPipelineLayout(
     reshade::api::device* device,
     reshade::api::pipeline_layout layout) {
   assert(layout.handle != 0u);
+  std::shared_ptr<SelectiveLayout> retired;
+  selective_layouts.erase_if({device, layout.handle}, [&](auto& entry) {
+    retired = std::move(entry.second);
+    return true;
+  });
+  RetireSelectiveLayout(std::move(retired));
 
   bool changed = false;
 
@@ -1906,6 +2113,8 @@ struct ConstantBufferRestore {
 struct PostCommandData {
   const std::function<void(reshade::api::command_list*)>* on_drawn = nullptr;
   std::vector<ConstantBufferRestore> constant_buffer_bindings;
+  std::optional<utils::state::CommandListSnapshot> root_arguments;
+  reshade::api::pipeline_layout original_layout = {0u};
 };
 
 static thread_local std::deque<PostCommandData> pending_post_command_data;
@@ -1917,6 +2126,8 @@ inline constexpr auto OnCommandAction = []<typename T, typename Context>(
     bool bypass_draw = false;
     const std::function<void(reshade::api::command_list*)>* on_drawn = nullptr;
     std::vector<ConstantBufferRestore> constant_buffer_bindings;
+    std::optional<utils::state::CommandListSnapshot> root_arguments;
+    reshade::api::pipeline_layout original_layout = {0u};
   };
 
   assert(context.matched_shader_stage.has_value() && context.matched_shader_hash != 0u && context.matched_stage_state.has_value());
@@ -1956,6 +2167,21 @@ inline constexpr auto OnCommandAction = []<typename T, typename Context>(
       renodx::utils::shader::PopulateStageState(&state);
     }
     if (state.pipeline_details == nullptr) return response;
+
+    if (state.pipeline_details->command_scoped) {
+      if (state.pipeline_details->replacement_blocked) return response;
+      // ReShade cannot replay D3D12 ExecuteIndirect with its signature/count buffer.
+      // Mesh commands remain native until their state/replay contract is tested.
+      if constexpr (std::is_same_v<typename Context::ArgumentType, utils::command_action::IndirectArguments>
+                    || std::is_same_v<typename Context::ArgumentType, utils::command_action::DispatchMeshArguments>) {
+        static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+        if (!warned.test_and_set(std::memory_order_relaxed)) {
+          utils::log::w("mods::shader selective injection: keeping unsupported indirect/mesh command native, shader=",
+                        utils::log::AsPtr(context.matched_shader_hash));
+        }
+        return response;
+      }
+    }
 
     const uint32_t shader_hash = context.matched_shader_hash;
     const CustomShader* custom_shader_info = &custom_shader;
@@ -2015,6 +2241,17 @@ inline constexpr auto OnCommandAction = []<typename T, typename Context>(
       utils::shader::BuildReplacementPipeline(state.pipeline);
     }
 
+    if (state.pipeline_details->command_scoped) {
+      if (custom_pipeline.handle != 0u || state.pipeline_details->replacement_pipeline.handle == 0u || !should_inject) return response;
+      response.root_arguments = utils::state::GetSnapshot(context.cmd_list);
+      response.original_layout = pipeline_layout;
+      if (!response.root_arguments.has_value()
+          || !response.root_arguments->ApplyRootArguments(pipeline_layout, state.pipeline_details->injection_layout, is_dispatch)) {
+        response.root_arguments.reset();
+        return response;
+      }
+    }
+
     // Perform Push
     const bool use_d3d12_root_cbv_injection = use_root_signature_cbv
                                                && context.cmd_list->get_device()->get_api() == reshade::api::device_api::d3d12;
@@ -2036,7 +2273,9 @@ inline constexpr auto OnCommandAction = []<typename T, typename Context>(
       }
 
       auto visibility = reshade::api::shader_stage::all;
-      if (!use_pipeline_layout_cloning) {
+      if (state.pipeline_details->command_scoped) {
+        visibility = (is_dispatch ? reshade::api::shader_stage::compute : reshade::api::shader_stage::all_graphics);
+      } else if (!use_pipeline_layout_cloning) {
         visibility = state.pipeline_details->injection_visibility;
       }
       const uint32_t injection_offset = constant_buffer_offset != 0
@@ -2072,6 +2311,15 @@ inline constexpr auto OnCommandAction = []<typename T, typename Context>(
       applied_replacement = true;
     } else {
       applied_replacement = utils::shader::ApplyReplacement(context.cmd_list, &state);
+    }
+
+    if (state.pipeline_details->command_scoped && !applied_replacement && response.root_arguments.has_value()) {
+      const bool restored = response.root_arguments->ApplyRootArguments(pipeline_layout, pipeline_layout, is_dispatch);
+      assert(restored);
+      response.root_arguments->ApplyPipelines(
+          (is_dispatch ? utils::state::PipelineBindPoint::COMPUTE : utils::state::PipelineBindPoint::GRAPHICS), true);
+      response.root_arguments.reset();
+      return response;
     }
 
     if (!custom_shader_info->views.empty()) {
@@ -2347,14 +2595,23 @@ inline constexpr auto OnCommandAction = []<typename T, typename Context>(
            it != post_data->constant_buffer_bindings.rend(); ++it) {
         it->snapshot.RestoreConstantBufferBindings(it->slot, context.IsDispatch());
       }
+      if (post_data->root_arguments.has_value()) {
+        const bool restored = post_data->root_arguments->ApplyRootArguments(
+            post_data->original_layout, post_data->original_layout, context.IsDispatch());
+        assert(restored);
+        post_data->root_arguments->ApplyPipelines(
+          (context.IsDispatch() ? utils::state::PipelineBindPoint::COMPUTE : utils::state::PipelineBindPoint::GRAPHICS), true);
+      }
       pending_post_command_data.pop_back();
     }
   };
 
-  if (response.on_drawn != nullptr || !response.constant_buffer_bindings.empty()) {
+  if (response.on_drawn != nullptr || !response.constant_buffer_bindings.empty() || response.root_arguments.has_value()) {
     pending_post_command_data.push_back({
         .on_drawn = response.on_drawn,
         .constant_buffer_bindings = std::move(response.constant_buffer_bindings),
+        .root_arguments = std::move(response.root_arguments),
+        .original_layout = response.original_layout,
     });
     result.replay = true;
     if (response.on_drawn != nullptr) {
@@ -2374,6 +2631,9 @@ inline void OnPresent(
     const reshade::api::rect* /*dest_rect*/,
     uint32_t /*dirty_rect_count*/,
     const reshade::api::rect* /*dirty_rects*/) {
+  if (use_selective_pipeline_injection) {
+    CollectSelectiveLayouts(swapchain->get_device());
+  }
   auto* data = renodx::utils::data::Get<DeviceData>(swapchain->get_device());
   if (data == nullptr) return;
 
@@ -2441,6 +2701,11 @@ static bool attached = false;
 template <typename T = float*, std::ranges::range CustomShaderList>
   requires std::convertible_to<std::ranges::range_value_t<CustomShaderList>, CustomShader>
 static void Use(DWORD fdw_reason, const CustomShaderList& new_custom_shaders, T* new_injections = nullptr) {
+  if (fdw_reason == DLL_PROCESS_DETACH && attached && use_selective_pipeline_injection) {
+    utils::shader::UnregisterConfigureReplacementCallback(OnConfigureSelectiveReplacement);
+    utils::pipeline::UnregisterOnDestroyCallback(OnDestroySelectivePipeline);
+    reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroySelectiveDevice);
+  }
   if (fdw_reason == DLL_PROCESS_ATTACH) {
     using_custom_replace = false;
     using_custom_inject = false;
@@ -2482,12 +2747,18 @@ static void Use(DWORD fdw_reason, const CustomShaderList& new_custom_shaders, T*
 
       custom_shaders.rehash(custom_shaders.size());
 
-      if (using_counted_shaders || push_injections_on_present || use_root_signature_cbv) {
+      if (use_selective_pipeline_injection) {
+        utils::shader::RegisterConfigureReplacementCallback(OnConfigureSelectiveReplacement);
+        utils::pipeline::RegisterOnDestroyCallback(OnDestroySelectivePipeline);
+        reshade::register_event<reshade::addon_event::destroy_device>(OnDestroySelectiveDevice);
+      }
+
+      if (using_counted_shaders || push_injections_on_present || use_root_signature_cbv || use_selective_pipeline_injection) {
         reshade::register_event<reshade::addon_event::present>(OnPresent);
       }
 
       if (!manual_shader_scheduling) {
-        if (force_pipeline_cloning || use_pipeline_layout_cloning) {
+        if (force_pipeline_cloning || use_pipeline_layout_cloning || use_selective_pipeline_injection) {
           for (const auto& [hash, shader] : (custom_shaders)) {
             for (const auto& [device, code] : shader.code_by_device) {
               renodx::utils::shader::UpdateReplacements({{hash, code}}, false, true, {device});

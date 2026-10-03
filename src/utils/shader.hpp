@@ -93,6 +93,7 @@ using DeviceShaderKey = std::pair<reshade::api::device*, uint32_t>;
 using ShaderBytecodeMap = cross_addon::parallel_flat_hash_map<DeviceShaderKey, std::span<const uint8_t>, std::shared_mutex>;
 using ShaderPipelineHandleSet = cross_addon::unordered_set<uint64_t>;
 using ShaderPipelineHandlesMap = cross_addon::parallel_flat_hash_map<DeviceShaderKey, ShaderPipelineHandleSet, std::shared_mutex>;
+using ConfigureReplacementCallback = void (*)(PipelineShaderDetails*, std::span<const pipeline::PipelineShaderHashEntry>);
 
 namespace internal {
 struct __declspec(uuid("5034968b-31f6-401d-a43b-68841aa55dec")) SharedData {
@@ -104,10 +105,22 @@ struct __declspec(uuid("5034968b-31f6-401d-a43b-68841aa55dec")) SharedData {
   bool use_shader_cache = false;
   bool use_pipeline_lookup = false;
   ShaderPipelineHandlesMap shader_pipeline_handles;
+  cross_addon::vector<ConfigureReplacementCallback> configure_replacement_callbacks;
 };
 
 static cross_addon::Shared<SharedData> shared;
 }  // namespace internal
+
+static void RegisterConfigureReplacementCallback(ConfigureReplacementCallback callback) {
+  auto& callbacks = internal::shared.data->configure_replacement_callbacks;
+  if (std::ranges::find(callbacks, callback) == callbacks.end()) {
+    callbacks.push_back(callback);
+  }
+}
+
+static void UnregisterConfigureReplacementCallback(ConfigureReplacementCallback callback) {
+  std::erase(internal::shared.data->configure_replacement_callbacks, callback);
+}
 
 template <typename F>
 static void ForEachRuntimeReplacement(reshade::api::device* device, F&& callback) {
@@ -168,6 +181,13 @@ inline PipelineShaderDetails::PipelineShaderDetails(
       this->descriptor_push_locations.emplace(binding, location);
     }
   });
+  for (const auto callback : shader::internal::shared.data->configure_replacement_callbacks) {
+    callback(this, shader_details);
+  }
+  if (this->replacement_blocked) {
+    this->initialized_replacement = true;
+    return;
+  }
   reshade::api::pipeline_subobject* replacement_subobjects = nullptr;
   for (const auto& identity : shader_details) {
     const uint32_t i = identity.subobject_index;
@@ -305,6 +325,12 @@ inline PipelineShaderDetails::PipelineShaderDetails(
       return;
     }
 
+    if (this->command_scoped) {
+      this->replacement_blocked = true;
+      this->initialized_replacement = true;
+      this->replacement_stages = static_cast<reshade::api::pipeline_stage>(0u);
+      return;
+    }
     assert(built_pipeline_ok);
 #ifdef DEBUG_LEVEL_0
     std::stringstream s;
@@ -462,9 +488,14 @@ static bool WithReplacementPipeline(const reshade::api::pipeline& pipeline, F&& 
   reshade::api::pipeline_subobject* subobjects = nullptr;
   uint32_t subobject_count = 0u;
   bool resolved = false;
+  bool blocked = false;
   pipeline::UpdatePipelineInfo(pipeline, [&](auto& info) {
     auto& details = info.details;
     if (details.destroyed) return;
+    if (details.replacement_blocked) {
+      blocked = true;
+      return;
+    }
     generation = info.generation;
     revision = details.replacement_revision;
     if (details.is_replacement) {
@@ -487,7 +518,7 @@ static bool WithReplacementPipeline(const reshade::api::pipeline& pipeline, F&& 
       subobjects = pipeline::ClonePipelineSubObjects(details.subobjects.data(), subobject_count);
     }
   });
-  if (generation == 0u) return false;
+  if (blocked || generation == 0u) return false;
   if (resolved) {
     std::invoke(callback, replacement, stages);
     return true;
@@ -977,7 +1008,7 @@ inline std::optional<reshade::api::pipeline> OnBindPipelineForReplacement(
 
   if (info != nullptr) {
     const auto& details = info->details;
-    if (details.destroyed || details.is_replacement) return reshade::api::pipeline{0u};
+    if (details.destroyed || details.is_replacement || details.command_scoped || details.replacement_blocked) return reshade::api::pipeline{0u};
     if (!details.initialized_replacement
         || (details.replacement_stages != static_cast<reshade::api::pipeline_stage>(0u)
             && details.replacement_pipeline.handle == 0u)) {
@@ -1093,6 +1124,9 @@ static void Use(DWORD fdw_reason) {
 
       break;
     case DLL_PROCESS_DETACH:
+      // Callback removal can register pipeline events; never repeat it after the module detached.
+      if (!attached) return;
+      attached = false;
       internal::shared.UnregisterEvent<reshade::addon_event::destroy_device>(OnDestroyDevice);
       renodx::utils::pipeline::UnregisterOnCreateCallback(OnCreatePipeline);
       renodx::utils::pipeline::UnregisterOnInitCallback(OnInitPipeline);
@@ -1102,8 +1136,6 @@ static void Use(DWORD fdw_reason) {
       renodx::utils::state::Use(fdw_reason);
       renodx::utils::pipeline_layout::Use(fdw_reason);
       renodx::utils::pipeline::Use(fdw_reason);
-      if (!attached) return;
-      attached = false;
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       break;
   }

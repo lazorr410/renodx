@@ -84,6 +84,8 @@ struct PipelineShaderDetails {
       pipeline_layout::DescriptorBindingKeyHash>
       descriptor_push_locations;
   uint64_t replacement_revision = 0u;
+  bool command_scoped = false;
+  bool replacement_blocked = false;
 
   PipelineShaderDetails() = default;
   PipelineShaderDetails(
